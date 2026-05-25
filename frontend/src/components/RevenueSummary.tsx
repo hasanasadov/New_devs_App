@@ -3,9 +3,13 @@ import { SecureAPI } from '../lib/secureApi';
 
 interface RevenueData {
     property_id: string;
+    tenant_id: string;
     total_revenue: number;
+    total_revenue_decimal?: string;
+    total_revenue_cents: number;
     currency: string;
     reservations_count: number;
+    period?: { month: number; year: number } | null;
 }
 
 interface RevenueSummaryProps {
@@ -61,7 +65,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
     if (error) return <div className="p-4 text-red-500 bg-red-50 rounded-lg">{error}</div>;
     if (!data) return null;
 
-    const displayTotal = Math.round(data.total_revenue * 100) / 100;
+    const displayTotal = data.total_revenue_cents / 100;
 
     return (
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow duration-300">
