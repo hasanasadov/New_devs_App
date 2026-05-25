@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
 from typing import Dict, Any, List, Optional
 import logging
-import os
 import uuid
+import base64
 from datetime import datetime
 from PIL import Image
 import io
@@ -26,9 +26,221 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp', 'gif'}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 AVATAR_SIZE = (300, 300)  # Max avatar dimensions
 
+_LOCAL_PROFILE_STORE: Dict[str, Dict[str, Any]] = {}
+_LOCAL_PREFERENCES_STORE: Dict[str, Dict[str, Any]] = {}
+_LOCAL_NOTIFICATION_PREFERENCES_STORE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
 def allowed_file(filename: str) -> bool:
     """Check if the file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def synthetic_id(prefix: str, user_id: str, extra: str = "") -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"propertyflow:{prefix}:{user_id}:{extra}"))
+
+
+def default_profile_data(user: AuthenticatedUser) -> Dict[str, Any]:
+    timestamp = now_iso()
+    return {
+        'id': synthetic_id('profile', user.id),
+        'user_id': user.id,
+        'display_name': (user.email.split('@')[0] if user.email else 'User'),
+        'bio': None,
+        'phone': None,
+        'department': None,
+        'job_title': None,
+        'location': None,
+        'timezone': 'UTC',
+        'language': 'en',
+        'theme': 'light',
+        'avatar_url': None,
+        'created_at': timestamp,
+        'updated_at': timestamp,
+    }
+
+
+def default_preferences_data(user: AuthenticatedUser) -> Dict[str, Any]:
+    timestamp = now_iso()
+    return {
+        'id': synthetic_id('preferences', user.id),
+        'user_id': user.id,
+        'notification_email': True,
+        'notification_push': True,
+        'notification_desktop': True,
+        'notification_sound': True,
+        'auto_refresh': True,
+        'compact_view': False,
+        'sidebar_collapsed': False,
+        'created_at': timestamp,
+        'updated_at': timestamp,
+    }
+
+
+def local_profile_row(user: AuthenticatedUser) -> Dict[str, Any]:
+    if user.id not in _LOCAL_PROFILE_STORE:
+        _LOCAL_PROFILE_STORE[user.id] = default_profile_data(user)
+    return dict(_LOCAL_PROFILE_STORE[user.id])
+
+
+def local_preferences_row(user: AuthenticatedUser) -> Dict[str, Any]:
+    if user.id not in _LOCAL_PREFERENCES_STORE:
+        _LOCAL_PREFERENCES_STORE[user.id] = default_preferences_data(user)
+    return dict(_LOCAL_PREFERENCES_STORE[user.id])
+
+
+def update_local_profile(user: AuthenticatedUser, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    row = local_profile_row(user)
+    row.update(update_data)
+    row['updated_at'] = now_iso()
+    _LOCAL_PROFILE_STORE[user.id] = row
+    return dict(row)
+
+
+def update_local_preferences(user: AuthenticatedUser, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    row = local_preferences_row(user)
+    row.update(update_data)
+    row['updated_at'] = now_iso()
+    _LOCAL_PREFERENCES_STORE[user.id] = row
+    return dict(row)
+
+
+def update_local_notification_preference(
+    user: AuthenticatedUser,
+    category: str,
+    update_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    user_preferences = _LOCAL_NOTIFICATION_PREFERENCES_STORE.setdefault(user.id, {})
+    timestamp = now_iso()
+    row = user_preferences.get(category, {
+        'id': synthetic_id('notification-preference', user.id, category),
+        'user_id': user.id,
+        'category': category,
+        'email_enabled': True,
+        'push_enabled': True,
+        'desktop_enabled': True,
+        'sound_enabled': True,
+        'created_at': timestamp,
+        'updated_at': timestamp,
+    })
+    row.update(update_data)
+    row['updated_at'] = timestamp
+    user_preferences[category] = row
+    return dict(row)
+
+
+def local_notification_preferences(user: AuthenticatedUser) -> List[Dict[str, Any]]:
+    return [
+        dict(preference)
+        for preference in _LOCAL_NOTIFICATION_PREFERENCES_STORE.get(user.id, {}).values()
+    ]
+
+
+def response_data(response: Any) -> List[Dict[str, Any]]:
+    data = getattr(response, 'data', None)
+    return data if isinstance(data, list) else []
+
+
+def with_profile_defaults(user: AuthenticatedUser, data: Dict[str, Any]) -> Dict[str, Any]:
+    row = default_profile_data(user)
+    row.update({key: value for key, value in data.items() if value is not None})
+    return row
+
+
+def with_preferences_defaults(user: AuthenticatedUser, data: Dict[str, Any]) -> Dict[str, Any]:
+    row = default_preferences_data(user)
+    row.update({key: value for key, value in data.items() if value is not None})
+    return row
+
+
+async def upsert_profile_row(user: AuthenticatedUser, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    update_payload = {**update_data, 'updated_at': now_iso()}
+
+    try:
+        response = supabase.table('user_profiles').update(update_payload).eq('user_id', user.id).execute()
+        data = response_data(response)
+        if data:
+            return with_profile_defaults(user, data[0])
+
+        create_data = with_profile_defaults(user, update_payload)
+        response = supabase.table('user_profiles').insert(create_data).execute()
+        data = response_data(response)
+        if data:
+            return with_profile_defaults(user, data[0])
+
+        logger.info(f"Profile row unavailable for user {user.id}; using local fallback store")
+    except Exception as db_error:
+        logger.warning(f"Profile upsert fell back to local store for user {user.id}: {db_error}")
+
+    return update_local_profile(user, update_payload)
+
+
+async def upsert_preferences_row(user: AuthenticatedUser, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    update_payload = {**update_data, 'updated_at': now_iso()}
+
+    try:
+        response = supabase.table('user_preferences').update(update_payload).eq('user_id', user.id).execute()
+        data = response_data(response)
+        if data:
+            return with_preferences_defaults(user, data[0])
+
+        create_data = with_preferences_defaults(user, update_payload)
+        response = supabase.table('user_preferences').insert(create_data).execute()
+        data = response_data(response)
+        if data:
+            return with_preferences_defaults(user, data[0])
+
+        logger.info(f"Preferences row unavailable for user {user.id}; using local fallback store")
+    except Exception as db_error:
+        logger.warning(f"Preferences upsert fell back to local store for user {user.id}: {db_error}")
+
+    return update_local_preferences(user, update_payload)
+
+
+async def upsert_notification_preference_row(
+    user: AuthenticatedUser,
+    category: str,
+    update_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    update_payload = {**update_data, 'updated_at': now_iso()}
+
+    try:
+        response = (
+            supabase.table('notification_preferences')
+            .update(update_payload)
+            .eq('user_id', user.id)
+            .eq('category', category)
+            .execute()
+        )
+        data = response_data(response)
+        if data:
+            return data[0]
+
+        create_data = {
+            'id': synthetic_id('notification-preference', user.id, category),
+            'user_id': user.id,
+            'category': category,
+            'email_enabled': True,
+            'push_enabled': True,
+            'desktop_enabled': True,
+            'sound_enabled': True,
+            'created_at': now_iso(),
+            **update_payload,
+        }
+        response = supabase.table('notification_preferences').insert(create_data).execute()
+        data = response_data(response)
+        if data:
+            return data[0]
+
+        logger.info(f"Notification preference unavailable for user {user.id}; using local fallback store")
+    except Exception as db_error:
+        logger.warning(f"Notification preference upsert fell back to local store for user {user.id}: {db_error}")
+
+    return update_local_notification_preference(user, category, update_payload)
 
 def resize_image(image_data: bytes, size: tuple = AVATAR_SIZE) -> bytes:
     """Resize image to specified dimensions while maintaining aspect ratio"""
@@ -66,40 +278,6 @@ async def get_profile(
     try:
         logger.info(f"User {user.email} is fetching their profile.")
         
-        # Create default profile data in case tables don't exist or profile is missing
-        now_iso = datetime.utcnow().isoformat()
-        # Build safe defaults matching the response models when DB rows are missing
-        default_profile = {
-            'id': f'synthetic-{user.id}',
-            'user_id': user.id,
-            'display_name': (user.email.split('@')[0] if user.email else 'User'),
-            'bio': None,
-            'phone': None,
-            'department': None,
-            'job_title': None,
-            'location': None,
-            'timezone': 'UTC',
-            'language': 'en',
-            'theme': 'light',
-            'avatar_url': None,
-            'created_at': now_iso,
-            'updated_at': now_iso,
-        }
-        
-        default_preferences = {
-            'id': f'synthetic-{user.id}',
-            'user_id': user.id,
-            'notification_email': True,
-            'notification_push': True,
-            'notification_desktop': True,
-            'notification_sound': True,
-            'auto_refresh': True,
-            'compact_view': False,
-            'sidebar_collapsed': False,
-            'created_at': now_iso,
-            'updated_at': now_iso,
-        }
-        
         profile = None
         preferences = None
         notification_preferences = []
@@ -110,37 +288,41 @@ async def get_profile(
             profile_response = supabase.table('user_profiles').select('*').eq('user_id', user.id).execute()
             if profile_response.data:
                 profile_data = profile_response.data[0]
-                profile = UserProfile(**profile_data)
+                profile = UserProfile(**with_profile_defaults(user, profile_data))
             else:
                 logger.info(f"No profile found for user {user.id}, using default profile")
-                profile = UserProfile(**default_profile)
+                profile = UserProfile(**local_profile_row(user))
         except Exception as profile_error:
             logger.warning(f"Error accessing user_profiles table for user {user.id}: {profile_error}")
             logger.info(f"Using default profile for user {user.id}")
-            profile = UserProfile(**default_profile)
+            profile = UserProfile(**local_profile_row(user))
         
         # Try to get user preferences
         try:
             preferences_response = supabase.table('user_preferences').select('*').eq('user_id', user.id).execute()
             if preferences_response.data:
                 preferences_data = preferences_response.data[0]
-                preferences = UserPreferences(**preferences_data)
+                preferences = UserPreferences(**with_preferences_defaults(user, preferences_data))
             else:
                 logger.info(f"No preferences found for user {user.id}, using default preferences")
-                preferences = UserPreferences(**default_preferences)
+                preferences = UserPreferences(**local_preferences_row(user))
         except Exception as preferences_error:
             logger.warning(f"Error accessing user_preferences table for user {user.id}: {preferences_error}")
             logger.info(f"Using default preferences for user {user.id}")
-            preferences = UserPreferences(**default_preferences)
+            preferences = UserPreferences(**local_preferences_row(user))
         
         # Try to get notification preferences
         try:
             notification_prefs_response = supabase.table('notification_preferences').select('*').eq('user_id', user.id).execute()
-            notification_preferences = [NotificationPreference(**pref) for pref in notification_prefs_response.data]
+            notification_rows = notification_prefs_response.data or local_notification_preferences(user)
+            notification_preferences = [NotificationPreference(**pref) for pref in notification_rows]
         except Exception as notif_error:
             logger.warning(f"Error accessing notification_preferences table for user {user.id}: {notif_error}")
             logger.info(f"Using empty notification preferences for user {user.id}")
-            notification_preferences = []
+            notification_preferences = [
+                NotificationPreference(**pref)
+                for pref in local_notification_preferences(user)
+            ]
         
         # Try to get unread notification count
         try:
@@ -192,16 +374,7 @@ async def update_profile(
                 detail="No valid fields to update"
             )
         
-        # Update profile
-        response = supabase.table('user_profiles').update(update_data).eq('user_id', user.id).execute()
-        
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Profile not found"
-            )
-        
-        updated_profile = UserProfile(**response.data[0])
+        updated_profile = UserProfile(**await upsert_profile_row(user, update_data))
         logger.info(f"Successfully updated profile for user {user.id}")
         
         return updated_profile
@@ -233,16 +406,7 @@ async def update_preferences(
                 detail="No valid fields to update"
             )
         
-        # Update preferences
-        response = supabase.table('user_preferences').update(update_data).eq('user_id', user.id).execute()
-        
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Preferences not found"
-            )
-        
-        updated_preferences = UserPreferences(**response.data[0])
+        updated_preferences = UserPreferences(**await upsert_preferences_row(user, update_data))
         logger.info(f"Successfully updated preferences for user {user.id}")
         
         return updated_preferences
@@ -275,25 +439,9 @@ async def update_notification_preference(
                 detail="No valid fields to update"
             )
         
-        # Update or create notification preference
-        response = supabase.table('notification_preferences').update(update_data).eq('user_id', user.id).eq('category', category).execute()
-        
-        if not response.data:
-            # Create if doesn't exist
-            create_data = {
-                'user_id': user.id,
-                'category': category,
-                **update_data
-            }
-            response = supabase.table('notification_preferences').insert(create_data).execute()
-        
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update notification preferences"
-            )
-        
-        updated_preference = NotificationPreference(**response.data[0])
+        updated_preference = NotificationPreference(
+            **await upsert_notification_preference_row(user, category, update_data)
+        )
         logger.info(f"Successfully updated notification preferences for user {user.id}, category {category}")
         
         return updated_preference
@@ -340,61 +488,46 @@ async def upload_avatar(
         # Resize image
         resized_image = resize_image(file_content)
         
-        # Generate unique filename
-        file_extension = file.filename.rsplit('.', 1)[1].lower()
         unique_filename = f"{user.id}/avatar_{uuid.uuid4().hex}.jpg"  # Always save as JPEG after processing
-        
+        public_url: Optional[str] = None
+
         try:
-            # Delete existing avatar if exists
-            existing_files = supabase.storage.from_('profile-pictures').list(user.id)
-            if existing_files:
-                for existing_file in existing_files:
-                    if existing_file['name'].startswith('avatar_'):
-                        supabase.storage.from_('profile-pictures').remove([f"{user.id}/{existing_file['name']}"])
-                        logger.info(f"Deleted existing avatar: {existing_file['name']}")
-        except Exception as delete_error:
-            logger.warning(f"Could not delete existing avatar: {delete_error}")
-        
-        # Upload new avatar
-        upload_response = supabase.storage.from_('profile-pictures').upload(
-            unique_filename,
-            resized_image,
-            file_options={'content-type': 'image/jpeg'}
-        )
-        
-        if upload_response.status_code != 200:
-            logger.error(f"Upload failed: {upload_response}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to upload avatar"
-            )
-        
-        # Get public URL
-        public_url = supabase.storage.from_('profile-pictures').get_public_url(unique_filename)
-        
-        # Update user profile with new avatar URL
-        profile_update = supabase.table('user_profiles').update({
-            'avatar_url': public_url
-        }).eq('user_id', user.id).execute()
-        
-        if not profile_update.data:
-            # Clean up uploaded file if profile update fails
             try:
-                supabase.storage.from_('profile-pictures').remove([unique_filename])
-            except:
-                pass
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update profile with new avatar"
+                # Delete existing avatar if exists
+                existing_files = supabase.storage.from_('profile-pictures').list(user.id)
+                if existing_files:
+                    for existing_file in existing_files:
+                        if existing_file['name'].startswith('avatar_'):
+                            supabase.storage.from_('profile-pictures').remove([f"{user.id}/{existing_file['name']}"])
+                            logger.info(f"Deleted existing avatar: {existing_file['name']}")
+            except Exception as delete_error:
+                logger.warning(f"Could not delete existing avatar: {delete_error}")
+
+            upload_response = supabase.storage.from_('profile-pictures').upload(
+                unique_filename,
+                resized_image,
+                file_options={'content-type': 'image/jpeg'}
             )
-        
+
+            status_code = getattr(upload_response, 'status_code', 200)
+            if status_code >= 400:
+                raise RuntimeError(f"Storage upload failed with status {status_code}: {upload_response}")
+
+            public_url = supabase.storage.from_('profile-pictures').get_public_url(unique_filename)
+        except Exception as storage_error:
+            logger.warning(f"Avatar storage unavailable for user {user.id}; using local data URL fallback: {storage_error}")
+            encoded = base64.b64encode(resized_image).decode('ascii')
+            public_url = f"data:image/jpeg;base64,{encoded}"
+
+        await upsert_profile_row(user, {'avatar_url': public_url})
+
         logger.info(f"Successfully uploaded avatar for user {user.id}")
-        
+
         return AvatarUploadResponse(
             avatar_url=public_url,
             message="Avatar uploaded successfully"
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -411,36 +544,33 @@ async def delete_avatar(
     """Delete user's current avatar"""
     try:
         logger.info(f"User {user.email} is deleting their avatar.")
-        
-        # Get current profile to find avatar URL
-        profile_response = supabase.table('user_profiles').select('avatar_url').eq('user_id', user.id).execute()
-        
-        if not profile_response.data or not profile_response.data[0].get('avatar_url'):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No avatar found"
-            )
-        
-        # Delete files from storage
+
+        avatar_url = local_profile_row(user).get('avatar_url')
         try:
-            existing_files = supabase.storage.from_('profile-pictures').list(user.id)
-            if existing_files:
-                files_to_delete = [f"{user.id}/{file['name']}" for file in existing_files if file['name'].startswith('avatar_')]
-                if files_to_delete:
-                    supabase.storage.from_('profile-pictures').remove(files_to_delete)
-                    logger.info(f"Deleted avatar files: {files_to_delete}")
-        except Exception as delete_error:
-            logger.warning(f"Could not delete avatar files: {delete_error}")
-        
-        # Update profile to remove avatar URL
-        supabase.table('user_profiles').update({
-            'avatar_url': None
-        }).eq('user_id', user.id).execute()
-        
+            profile_response = supabase.table('user_profiles').select('avatar_url').eq('user_id', user.id).execute()
+            data = response_data(profile_response)
+            if data:
+                avatar_url = data[0].get('avatar_url')
+        except Exception as profile_error:
+            logger.warning(f"Could not fetch avatar from profile store for user {user.id}: {profile_error}")
+
+        if avatar_url and not str(avatar_url).startswith('data:'):
+            try:
+                existing_files = supabase.storage.from_('profile-pictures').list(user.id)
+                if existing_files:
+                    files_to_delete = [f"{user.id}/{file['name']}" for file in existing_files if file['name'].startswith('avatar_')]
+                    if files_to_delete:
+                        supabase.storage.from_('profile-pictures').remove(files_to_delete)
+                        logger.info(f"Deleted avatar files: {files_to_delete}")
+            except Exception as delete_error:
+                logger.warning(f"Could not delete avatar files: {delete_error}")
+
+        await upsert_profile_row(user, {'avatar_url': None})
+
         logger.info(f"Successfully deleted avatar for user {user.id}")
-        
+
         return {"message": "Avatar deleted successfully"}
-        
+
     except HTTPException:
         raise
     except Exception as e:
