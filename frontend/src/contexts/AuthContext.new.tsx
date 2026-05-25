@@ -56,13 +56,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       source = 'jwt_claims';
     }
 
-    // 2. Fallback to app_metadata  
+    // 2. Fallback to direct user tenant from the local auth response
+    if (!tenant_id && enhancedUser.tenant_id) {
+      tenant_id = enhancedUser.tenant_id;
+      source = 'user_tenant_id';
+    }
+
+    // 3. Fallback to app_metadata
     if (!tenant_id && enhancedUser.app_metadata?.tenant_id) {
       tenant_id = enhancedUser.app_metadata.tenant_id;
       source = 'app_metadata';
     }
 
-    // 3. Fallback to user_metadata
+    // 4. Fallback to user_metadata
     if (!tenant_id && enhancedUser.user_metadata?.tenant_id) {
       tenant_id = enhancedUser.user_metadata.tenant_id;
       source = 'user_metadata';
@@ -94,8 +100,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     let tenant_id: string | null = null;
     let source = 'none';
 
-    // Try app_metadata first
-    if (enhancedUser.app_metadata?.tenant_id) {
+    // Try direct local-auth tenant first
+    if (enhancedUser.tenant_id) {
+      tenant_id = enhancedUser.tenant_id;
+      source = 'user_tenant_id';
+    }
+    // Then app_metadata
+    else if (enhancedUser.app_metadata?.tenant_id) {
       tenant_id = enhancedUser.app_metadata.tenant_id;
       source = 'app_metadata';
     }
